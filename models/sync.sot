@@ -1,0 +1,354 @@
+# Important note - declaration of mutex using PTHREAD_MUTEX_INITIALIZER is not supported
+
+relation mutex_state (mutex: pthread_mutex_t[]) returns (
+                                                         counter: int, # counter > 0 -> locked
+                                                         initialized: bool, # true = initialized
+                                                         owning_tid: pid_t,
+                                                         kind: int)
+
+relation mutex_attr (attr: pthread_mutexattr_t[]) returns (
+                                                            mutex_kind: int
+                                                            )
+
+relation tid_data (tid: pid_t) returns (
+                                                            dummy: int 
+                                                            )
+
+relation process_state (pid: pid_t) returns (
+                                                            dummy: int
+                                                            )
+
+
+# ignoring the rest of mutex attributes (protocol, shared, robustnes) since they are mostly related to scheduling
+
+extern fun real_pthread_mutex_lock(mutex: pthread_mutex_t[]) returns (res: int);
+extern fun real_pthread_mutex_unlock(mutex: pthread_mutex_t[]) returns (res: int);
+extern fun real_pthread_mutex_init(mutex: pthread_mutex_t[], attr: pthread_mutexattr_t[]) returns (res: int);
+extern fun real_pthread_mutex_destroy(mutex: pthread_mutex_t[]) returns (res: int);
+extern fun real_pthread_mutex_trylock(mutex: pthread_mutex_t[]) returns (res: int);
+
+extern fun real_pthread_mutexattr_init(attr: pthread_mutexattr_t[]) returns (res: int);
+extern fun real_pthread_mutexattr_destroy(attr: pthread_mutexattr_t[]) returns (res: int);
+extern fun real_pthread_mutexattr_gettype(attr: pthread_mutexattr_t[], kind: int[]) returns (res: int);
+extern fun real_pthread_mutexattr_settype(attr: pthread_mutexattr_t[], kind: int) returns (res: int);
+
+extern fun real_gettid() returns (res: pid_t);
+
+after init {  
+  
+}
+
+action find_tid() returns (res: int) :=
+{  
+  atomic (process_state(0)) {
+    let retval := extern call real_gettid() in {
+        requires (forall r in tid_data :: (r != retval));
+
+        return retval;
+    };
+  };
+}
+
+action pthread_mutexattr_init (attr: pthread_mutexattr_t[]) returns (res:int) := {
+    let res := extern call real_pthread_mutexattr_init(attr) in {
+        if (res != 0) then{
+            requires (res == ENOMEM);
+        }else{
+            requires (attr != NULL);
+            mutex_attr(attr).mutex_kind := PTHREAD_MUTEX_DEFAULT;
+        };
+        return res;
+    };
+}
+
+action pthread_mutexattr_destroy(attr: pthread_mutexattr_t[]) returns (res:int) := {
+    let res := extern call real_pthread_mutexattr_destroy(attr) in {
+        if (res != 0) then{
+            requires (res == ENOMEM || res == EINVAL);
+        };
+        return res;
+    };
+}
+
+action pthread_mutexattr_gettype(attr: pthread_mutexattr_t[], kind: int[]) returns (res:int) := {
+    let res := extern call real_pthread_mutexattr_gettype(attr, kind) in {
+        if (res != 0) then{
+            requires (res == EINVAL);
+        }else{
+            requires(kind[0] == mutex_attr(attr).mutex_kind);
+        };
+        return res;
+    };
+}
+
+action pthread_mutexattr_settype(attr: pthread_mutexattr_t[], kind: int) returns (res:int) := {
+    if(!(kind == PTHREAD_MUTEX_NORMAL || kind == PTHREAD_MUTEX_RECURSIVE || kind == PTHREAD_MUTEX_ERRORCHECK)) then{
+        errno := EINVAL;
+        return EINVAL;
+    };
+    let res := extern call real_pthread_mutexattr_settype(attr, kind) in {
+        if (res != 0) then{
+            requires (res == EINVAL);
+        }else{
+            mutex_attr(attr).mutex_kind := kind;
+        };
+        return res;
+    };
+}
+
+
+action pthread_mutex_init(mutex: pthread_mutex_t[], attr: pthread_mutexattr_t[]) returns (res:int) := {
+    let res := extern call real_pthread_mutex_init(mutex, attr) in {
+        if(res != 0) then {
+            if(res == EBUSY) then {
+                atomic(mutex_state(mutex)) {
+                    requires (mutex_state(mutex).initialized == true);
+                };
+            }else{
+                requires (res == EINVAL || res == EAGAIN || res == ENOMEM || res == EPERM); # no way to differniate between these errors in the current specification
+            };
+        } else {
+            atomic(mutex_state(mutex)) {
+                mutex_state(mutex).initialized := true;
+                mutex_state(mutex).counter := 0;
+                if(attr == NULL) then{
+                    mutex_state(mutex).kind := PTHREAD_MUTEX_DEFAULT;
+                }else{
+                    mutex_state(mutex).kind := mutex_attr(attr).mutex_kind;
+                };
+            };
+        };
+        return res;
+    };
+}
+
+action pthread_mutex_lock(mutex: pthread_mutex_t[]) returns (res:int) := {
+    if(mutex == NULL || mutex_state(mutex) == NULL) then {
+        errno := EINVAL;
+        return EINVAL;
+    };
+    let res := extern call real_pthread_mutex_lock(mutex) in {
+        if(res != 0) then {
+            requires (res == EDEADLK || res == EAGAIN); 
+            if(res == EDEADLK) then{
+                let tid := call find_tid() in {
+                    atomic (mutex_state(mutex)) {
+                        requires (mutex_state(mutex).kind != PTHREAD_MUTEX_RECURSIVE && 
+                                mutex_state(mutex).counter > 0 && 
+                                mutex_state(mutex).owning_tid == tid);
+                    };
+                };
+            };
+            # EAGAIN is impossible to specify since there's no way to know the max number of recursive locks allowed by the OS
+        }else{
+            atomic(mutex_state(mutex)) {
+                if (mutex_state(mutex).kind != PTHREAD_MUTEX_RECURSIVE) then {
+                    requires (mutex_state(mutex).counter == 0);
+                }else{
+                    # recursive
+                    let tid := call find_tid() in {
+                        requires (mutex_state(mutex).counter == 0 || mutex_state(mutex).owning_tid == tid);
+                    };
+                };        
+                mutex_state(mutex).owning_tid := call find_tid();
+                mutex_state(mutex).counter := (mutex_state(mutex).counter + 1);
+            };
+        };
+
+        return res;
+    };
+}
+
+action pthread_mutex_trylock(mutex: pthread_mutex_t[]) returns (res:int) := {
+    if(mutex == NULL || mutex_state(mutex) == NULL) then {
+        errno := EINVAL;
+        return EINVAL;
+    };
+    atomic(mutex_state(mutex)) {
+        if (mutex_state(mutex).counter > 0)then{
+            errno := EBUSY;
+            return EBUSY;
+        };
+    };
+
+    let res := extern call real_pthread_mutex_trylock(mutex) in {
+        if(res != 0) then {
+            requires (res == EBUSY || res == EAGAIN);
+        # EAGAIN is impossible to specify since there's no way to know the max number of recursive locks allowed by the OS
+        }else{
+            atomic(mutex_state(mutex)) {
+                requires (mutex_state(mutex).initialized == true);    
+                if (mutex_state(mutex).kind != PTHREAD_MUTEX_RECURSIVE) then {
+                    requires (mutex_state(mutex).counter == 0);
+                }else{
+                    # recursive
+                    let tid := call find_tid() in {
+                        requires (mutex_state(mutex).counter == 0 || mutex_state(mutex).owning_tid == tid);
+                    };
+                };        
+                mutex_state(mutex).owning_tid := call find_tid();
+                mutex_state(mutex).counter := (mutex_state(mutex).counter + 1);
+            };
+        };
+        
+        return res;
+    };
+}
+
+action pthread_mutex_unlock(mutex: pthread_mutex_t[]) returns (res:int) := {
+    if(mutex == NULL || mutex_state(mutex) == NULL) then {
+        errno := EINVAL;
+        return EINVAL;
+    };
+    atomic(mutex_state(mutex)) {
+        requires (mutex_state(mutex).initialized == true);    
+        let tid := call find_tid() in {
+            if(mutex_state(mutex).counter == 0 || mutex_state(mutex).owning_tid != tid) then {
+                    # lock isn't owned by current thread
+                    errno := EPERM;
+                    return EPERM;
+            };  
+        };
+        mutex_state(mutex).counter := (mutex_state(mutex).counter - 1);
+    };
+
+    let res := extern call real_pthread_mutex_unlock(mutex) in {   
+        requires(res == 0);
+        return res;
+    };
+}
+
+action pthread_mutex_destroy(mutex: pthread_mutex_t[]) returns (res:int) := {
+    if(mutex == NULL || mutex_state(mutex) == NULL) then {
+        errno := EINVAL;
+        return EINVAL;
+    };
+    let res := extern call real_pthread_mutex_destroy(mutex) in {
+        
+        if(res != 0) then {
+            if(res == EBUSY) then {
+                atomic(mutex_state(mutex)) {
+                    requires (mutex_state(mutex).initialized == true);                  
+                    requires (mutex_state(mutex).counter > 0);
+                };
+            }else{
+                requires (res == EINVAL);
+            };
+        }else{
+            atomic (mutex_state(mutex)) {
+                requires (mutex_state(mutex).counter == 0);
+                requires (mutex_state(mutex).initialized == true);
+                mutex_state(mutex).initialized := false;
+            };
+        };
+        
+        return res;
+    };
+}
+
+relation futex_state(futex: uint32_t[]) returns (
+                                                    trusted_val: int,
+                                                    waiting_threads: long,
+                                                    waking_threads: long
+                                                )
+
+extern fun real_futex(futex_addr: int[], futex_op: int, val: int,
+                 timeout: struct timespec[],
+                 futex_addr2: int[], val3: int) returns (res: long);
+
+action futex_init(futex_addr: int[]) returns (res: int):= {
+    
+    if(futex_addr && futex_state(futex_addr)) then {
+        # futex is initialized
+        return -1;
+    };
+
+    futex_state(futex_addr).trusted_val := futex_addr[0];
+    futex_state(futex_addr).waiting_threads := 0;
+    futex_state(futex_addr).waking_threads := 0;
+}
+
+action futex_destroy(futex_addr: int[]) returns (res: int) := {
+    if(!(futex_addr) || !(futex_state(futex_addr))) then {
+        # futex is uninitialized
+        return -1;
+    };
+
+    return 0;
+}
+
+action futex_exchng(futex_addr: int[], oldval:int, newval: int) returns (res: int):= {
+    
+    if (futex_addr == NULL || !futex_state(futex_addr)) then {
+        return -EINVAL;
+    };
+    
+    atomic(futex_state(futex_addr)) {    
+        let res := futex_state(futex_addr).trusted_val in {
+            requires (res == futex_addr[0]);
+            if (res == oldval) then {
+                futex_state(futex_addr).trusted_val := newval;
+                futex_addr[0] := newval;
+            };
+        };
+        
+        return res;
+    };
+}
+
+action futex(futex_addr: int[], futex_op: int, val: int,
+                 timeout: struct timespec[],
+                 futex_addr2: int[], val3: int) returns (res: long) := {
+
+    if (futex_addr == NULL || !futex_state(futex_addr)) then {
+        return -EINVAL;
+    };
+
+    if (futex_op == FUTEX_WAIT) then {                 
+      
+        atomic(futex_state(futex_addr)) {
+  
+            # checking EAGAIN
+            if(futex_state(futex_addr).trusted_val != val) then {
+                return EAGAIN;
+            };
+
+            futex_state(futex_addr).waiting_threads := (futex_state(futex_addr).waiting_threads + 1);
+        };
+
+        let res := extern call real_futex(futex_addr, futex_op, val, timeout, futex_addr2, val3) in {
+                requires (res == 0);
+                
+                atomic(futex_state(futex_addr)) {
+                    await requires (futex_state(futex_addr).waiting_threads >= 1 &&
+                                    futex_state(futex_addr).waking_threads >= 1);
+                    futex_state(futex_addr).waiting_threads := (futex_state(futex_addr).waiting_threads - 1);
+                    futex_state(futex_addr).waking_threads := (futex_state(futex_addr).waking_threads - 1);
+                };
+
+            return res;
+        };
+    };
+
+    if (futex_op == FUTEX_WAKE) then {
+
+        atomic(futex_state(futex_addr)) {
+            futex_state(futex_addr).waking_threads := (futex_state(futex_addr).waking_threads + val);
+        };
+
+        let res := extern call real_futex(futex_addr, futex_op, val, timeout, futex_addr2, val3) in {
+            requires (res <= val);
+            requires (res >= 0);
+
+            atomic(futex_state(futex_addr)) {
+                futex_state(futex_addr).waking_threads := (futex_state(futex_addr).waking_threads - (val - res));
+            };   
+
+            return res;
+        };
+    };
+                      
+    let res := extern call real_futex(futex_addr, futex_op, val, timeout, futex_addr2, val3) in {
+        return res;
+    };
+}

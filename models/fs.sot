@@ -1,0 +1,1590 @@
+relation dir_entries(path: string) returns (inode: uint64_t)
+
+relation file_data(path: string) returns (inode: uint64_t)
+                                        
+relation open_files_state(num: int) returns (dummy: int)
+
+relation inode_data(inode: uint64_t) returns (content:char[], 
+                                         mode: int, 
+                                         gid: int, 
+                                         uid: int, 
+                                         dir_entries: relation dir_entries,
+                                         symlink_val : string,
+                                         tags:char[], 
+                                         ivs: char[], 
+                                         num_tags:int, 
+                                         num_ivs:int, 
+                                         blocks_written:char[], 
+                                         sz: size_t,
+                                         link_count: int,
+                                         open_fd_count: int, 
+                                         to_delete: bool)
+
+relation file_state(fd: int) returns (off:int, 
+                                      flags: int, 
+                                      inode: uint64_t,
+                                      pathname: string)
+
+relation open_dirs_state(dirp: void[]) returns (pathname: string, 
+                                                dir_entries: relation dir_entries, 
+                                                inode: uint64_t)
+
+relation seen_dirs(fd: int) returns (inode: uint64_t,
+                                     dir_entries: relation dir_entries)
+
+relation process_state(pid: int) returns (cwd: string, 
+                                          user: string, 
+                                          root: bool,
+                                          uid: int, 
+                                          gid: int, 
+                                          supp_groups: int[],
+                                          num_supp_groups: int,
+                                          ppid: int,
+                                          max_path_size: int, 
+                                          max_file_size: size_t, 
+                                          as_size: int, 
+                                          as_base: uintptr_t, 
+                                          umask: int)
+
+# All memory ranges currently allocated to the process
+relation mem_state(addr: uintptr_t) returns (size:size_t, 
+                                             perms: int, 
+                                             flags: int, 
+                                             fd: int, 
+                                             offset: off_t)
+
+constant BLK_SIZE:size_t := 4096
+
+extern fun is_in_supp_groups(gid: int, supp_groups:int[], num_supp_groups: int) returns (res: bool);
+extern fun rename_children_paths(oldpathname: string, newpathname: string) returns (res: void);
+
+# extern fun strcat(dest: string, src: string) returns (res: string);
+
+# NOTE: external definition of functions which are part of the STL (our way to describe C<-->SOT binding)
+extern fun path_valid(path: string) returns (err: int);
+extern fun get_cannonical_pathname(path: string) returns (pathname: string);
+extern fun real_open(path: string, flags: int, mode: int) returns (res: int);
+# extern fun real_opendir(path: string) returns (res: DIR[]);
+# extern fun real_readdir(dirp: DIR[]) returns (res: struct dirent[]);
+# extern fun real_closedir(dirp: DIR[]) returns (res: int);
+extern fun real_getdents64(fd: int, buf: char[], count: uint) returns (res: int);
+extern fun validate_getdents64(fd: uint, buf: char[], count: uint) returns (res:int);
+extern fun real_readlink(path: string, buf: char[], bufsiz: size_t) returns (res: ssize_t);
+extern fun real_close(fd: int) returns (res: int);
+extern fun real_unlink(path: string) returns (res: int);
+extern fun real_pread(fd: int, buf: char[], cnt:size_t, off: off_t) returns (res: ssize_t);
+extern fun real_pwrite(fd: int, buf: char[], cnt:size_t, off: off_t) returns (res: ssize_t);
+extern fun decrypt_blocks(enc_buf:char[], dec_buf: char[], tags: char[], ivs: char[], blocks_written: char[], idx: int, num_blocks: int) returns (res: bool);
+extern fun encrypt_blocks(enc_buf:char[], dec_buf: char[], tags: char[], ivs: char[], idx: int, num_blocks: int) returns (res: bool);
+extern fun real_lseek(fd: int, offset: off_t, whence: int) returns (res: off_t);
+extern fun real_lstat(path: string, statbuf: struct stat[]) returns (res: int);
+extern fun real_fstat(fd: int, statbuf: struct stat[]) returns (res: int);
+extern fun real_mkdir(path: string, mode: mode_t) returns (res: int);
+extern fun real_rmdir(path: string) returns (res: int);
+extern fun real_chdir(path: string) returns (res: int);
+extern fun real_symlink(target: string, linkpath: string) returns (res: int);
+extern fun real_rename(oldpath: string, newpath: string) returns (res: int);
+extern fun real_link(oldpath: string, newpath: string) returns (res: int);
+extern fun real_chmod(path: string, mode: mode_t) returns (res: int);
+extern fun real_fchmod(fd: int, mode: mode_t) returns (res: int);
+extern fun real_lchown(path: string, owner: uid_t, group: gid_t) returns (res: int);
+extern fun real_truncate(path: string, length: off_t) returns (res: int);
+extern fun real_ftruncate(fd: int, length: uint64_t) returns (res: int);
+extern fun canonicalize_filename_mode1(path: string, can: int, buf: string, mode: int) returns (res: int);
+extern fun get_dirname(path: string, dir_name: string) returns (res: int);
+extern fun get_basename(path: string, base_name: string) returns (res: int);
+
+action find_inode(path: string, statbuf: struct stat[]) returns (res: int) :=
+{
+  let retval := extern call real_lstat(path, statbuf) in {
+    requires (retval == 0);
+    requires (forall r in inode_data :: (r != statbuf[0].st_ino));
+
+    return statbuf[0].st_ino;
+  };
+}
+
+#
+# NOTE: if we don't use VFS we need a script that autmagically fills the data 
+# the end-application uses. The tool can be based on strace+parser+readlink
+#
+after init {  
+  # Two first inodes are ignored by FSes
+  inode_data(0).sz := 0;
+  inode_data(1).sz := 0;
+
+  # Processes are opened with stdin,stdout,stderr. Ignore their definitions
+  file_state(0).off := 0;
+  file_state(1).off := 0;
+  file_state(2).off := 0;
+
+  let statbuf: struct stat[](1000) in {
+    let retval := call find_inode("/", statbuf) in {          
+      file_data("/").inode := retval;
+  
+      # Most FS impl use 2 as the root folder inode num. It's not mandated by spec but lets follow their convention
+      # file_data("/").inode := 2; 
+      inode_data(file_data("/").inode).sz := 4096;
+      inode_data(file_data("/").inode).mode := (S_IFDIR | 0775);
+      inode_data(file_data("/").inode).gid := VERIFY_FS_GID;
+      inode_data(file_data("/").inode).uid := VERIFY_FS_UID;
+      inode_data(file_data("/").inode).link_count := 2;
+      inode_data(file_data("/").inode).dir_entries(".").inode := file_data("/").inode;
+      inode_data(file_data("/").inode).dir_entries("..").inode := file_data("/").inode;
+    };
+  };
+
+  process_state(0).max_path_size := 4096;
+  # NOTE: I set to root because well, I run the script with root permissions :(
+  process_state(0).uid := VERIFY_FS_UID;
+  process_state(0).gid := VERIFY_FS_GID;
+  # process_state(0).supp_groups[0:65536] := 0;
+  process_state(0).num_supp_groups := 0;
+  process_state(0).ppid := 0;#1000;
+  process_state(0).umask := (S_IWGRP | S_IWOTH);
+  process_state(0).cwd := "/";
+  process_state(0).max_file_size := 17592186044416; # 16TB on ext4
+  # process_state(0).root := true;
+}
+
+action validatedents(fd: int, d_name: string, d_ino: uint64_t[], d_type: char[]) returns (res: bool) :=
+{
+  # Check if we visited everything
+  if (forall r in inode_data(file_state(fd).inode).dir_entries :: 
+      # !seen_dirs(fd).dir_entries(r)) then {
+      exists r1 in seen_dirs(fd).dir_entries:: (r == r1)) then {
+      return false;
+    };
+
+  # Make sure file exists
+  requires (
+  exists r in inode_data(file_state(fd).inode).dir_entries :: 
+    (r == d_name)
+  );
+
+  # and, make sure we didn't see it twice
+  requires (
+  forall r in seen_dirs(fd).dir_entries ::
+    (r != d_name)
+  );
+
+  # Make sure ino makes sense
+  requires (
+  exists r in inode_data(file_state(fd).inode).dir_entries ::
+    (inode_data(file_state(fd).inode).dir_entries(r).inode == d_ino[0] && r == d_name)
+  );
+
+  # Make sure type makes sense
+  requires (
+  exists r in inode_data(file_state(fd).inode).dir_entries ::
+    (((inode_data(inode_data(file_state(fd).inode).dir_entries(r).inode).mode & 0170000) >> 12) == d_type[0] && r == d_name)
+  );
+
+  seen_dirs(fd).dir_entries(d_name).inode := d_ino[0];
+  return true;
+}
+
+#
+# Actions
+#
+
+action update_process_state(pid: pid_t, uid: uid_t, gid: gid_t, supp_groups: gid_t[], supp_groups_num: int, umask: mode_t, cwd: string) returns (res: void) := {
+  process_state(0).uid := uid;
+  process_state(0).gid := gid;
+  process_state(0).supp_groups[0:supp_groups_num] := supp_groups[0:supp_groups_num];
+  process_state(0).num_supp_groups := supp_groups_num;
+  process_state(0).umask := umask;
+  process_state(0).cwd := cwd;
+}
+
+action getcwd() returns (res: string)   
+  fuzz { res != NULL || res == -EACCES || res == -EFAULT || res == -EINVAL ||
+  res == -ENAMETOOLONG || res == -ENOENT }
+:= {
+  return process_state(0).cwd;
+}
+
+action file_exists(path: string) returns (res: bool) := {
+  if (file_data(path)) then {
+    return true;
+  };
+
+  return false;
+}
+
+action is_directory(path: string) returns (res: bool) := {
+  if ((inode_data(file_data(path).inode).mode & S_IFDIR) == S_IFDIR) then {
+    return true;
+  };
+
+  return false;
+}
+
+action is_symlink(path: string) returns (res: bool) := {
+  if ((inode_data(file_data(path).inode).mode & S_IFLNK) == S_IFLNK) then {
+    return true;
+  };
+
+  return false;
+}
+
+action open(path: string, flags: int, mode: int) returns (res:int)
+  fuzz { res == -EACCES || res == -EEXIST || res == -EINVAL || res == -EFAULT 
+  || res == -EISDIR || res == -ELOOP || res == -ENAMETOOLONG || res == -ENOENT 
+  || res == -ENOTDIR || res == -EPERM || res >= 0 || 
+  res == 1 || res == 2 || res == 3 || res == 4 || res == 5 || res == 6 ||
+  res == 7 || res == 8 || res == 9 || res == 10 ||
+  res == 2147483647 || res == -2147483648 } # NOTE: should fuzz for path change?
+ := {  
+
+  let pathname:char[](PATH_MAX) in {
+  # CAN_ALL_BUT_LAST = Check ignoring ENOENT if the last component doesn't exist
+  let path_valid := extern call canonicalize_filename_mode1(path, CAN_ALL_BUT_LAST, pathname, O_RDONLY) in {
+    if (path_valid != 0) then {
+      # error is set from path resolution code
+      return path_valid;
+    };
+    if ((file_data(pathname)) && ((flags & O_ACCMODE) == O_RDONLY)) then {
+      let access_valid := call access_internal(pathname, R_OK) in {
+        if (access_valid != 0) then {
+          # NOTE: error should be set by the access action
+          return access_valid;
+        };
+      };
+    };
+
+    if ((file_data(pathname)) && ((flags & O_ACCMODE) == O_WRONLY)) then {
+      let access_valid := call access_internal(pathname, W_OK) in {
+        if (access_valid != 0) then {
+          # NOTE: error should be set by the access action
+          return access_valid;
+        };
+      };
+    };
+
+    if ((file_data(pathname)) && ((flags & O_ACCMODE) == O_RDWR)) then {
+      let access_valid := call access_internal(pathname, (R_OK | W_OK)) in {
+        if (access_valid != 0) then {
+          # NOTE: error should be set by the access action
+          return access_valid;
+        };
+      };
+    };
+
+    if ((file_data(pathname)) && ((flags & O_TRUNC) == O_TRUNC)) then {
+      let access_valid := call access_internal(pathname, W_OK) in {
+        if (access_valid != 0) then {
+          # NOTE: error should be set by the access action
+          return access_valid;
+        };
+      };
+    };
+    
+    if (!file_data(pathname) && ((flags & O_CREAT) != O_CREAT)) then {
+      return -ENOENT;
+    };
+
+    if (!file_data(pathname) && ((flags & O_DIRECTORY) == O_DIRECTORY)) then {
+      return -ENOTDIR;
+    };
+
+    let dir_name:char[](PATH_MAX) in {
+    let base_name:char[](PATH_MAX) in {              
+    let x1 := extern call get_dirname(pathname, dir_name) in {
+    let x2 := extern call get_basename(pathname, base_name) in {
+
+    # pathname already exists and O_CREAT and O_EXCL were used.
+    if (((flags & O_CREAT) == O_CREAT) && ((flags & O_EXCL) == O_EXCL) && file_data(pathname)) then {
+      return -EEXIST;
+    };
+
+    if (((flags & O_TMPFILE) == O_TMPFILE) && !((flags & O_ACCMODE) == O_WRONLY) && !((flags & O_ACCMODE) == O_RDWR)) then {
+        return -EINVAL;
+      };
+
+    if (file_data(pathname)) then {
+      # The O_NOATIME flag was specified, but the effective user ID of the caller did not match the owner of the file and the caller was not privileged.
+      # or the operation was prevented by a file seal; see fcntl(2).
+      if (((flags & O_NOATIME) == O_NOATIME) && (process_state(0).uid != (inode_data(file_data(pathname).inode).uid)) && (process_state(0).uid != 0)) then {
+        return -EPERM;
+      };
+
+      #pathname refers to a directory and the access requested involved writing (that is, O_WRONLY or O_RDWR is set).
+      #pathname refers to an existing directory, O_TMPFILE and one of O_WRONLY or O_RDWR were specified in flags, but this kernel version does not provide the O_TMPFILE functionality.
+      if (          
+        ((inode_data(file_data(pathname).inode).mode & S_IFDIR) == S_IFDIR) && 
+        (((flags & O_ACCMODE) == O_WRONLY) || ((flags & O_ACCMODE) == O_RDWR))
+        ) then {
+        return -EISDIR;
+      };
+
+      if (
+        ((inode_data(file_data(pathname).inode).mode & S_IFDIR) != S_IFDIR) && 
+        ((flags & O_DIRECTORY) == O_DIRECTORY)
+        ) then {
+        return -ENOTDIR;
+      };
+    };
+
+    # The file did not exist yet and write access to the parent directory is not allowed.
+    if (((flags & O_CREAT) == O_CREAT) && (!file_data(pathname))) then {
+      let access_valid := call access_internal(dir_name, W_OK) in {
+        if (access_valid != 0) then {
+          # NOTE: error should be set by the access action
+          return access_valid;
+        };
+      };
+    };
+
+    # otherwise, success, call the real syscall
+    let res := extern call real_open(path, flags, mode) in {
+      # Check not malicious OS that didn't comp 
+      requires (res >= 0 && forall r in file_state :: (r != res)); #!file_state(res)
+      
+      #      
+      # Update state    
+      #             
+
+      if ((flags & O_CREAT) == O_CREAT) then {
+        let statbuf: struct stat[](1000) in {
+          let retval := call find_inode(path, statbuf) in {          
+            file_data(pathname).inode := retval;
+          };
+        };
+        
+        inode_data(file_data(pathname).inode).link_count := 1;
+        inode_data(file_data(pathname).inode).mode := ((mode | S_IFREG) & ~(process_state(0).umask));
+        inode_data(file_data(pathname).inode).uid := process_state(0).uid;        
+        inode_data(file_data(pathname).inode).gid := process_state(0).gid;          
+        inode_data(file_data(pathname).inode).sz := 0;
+        inode_data(file_data(pathname).inode).num_tags := 0;
+        inode_data(file_data(pathname).inode).num_ivs := 0;
+        inode_data(file_data(pathname).inode).open_fd_count := 0;
+        inode_data(file_data(pathname).inode).to_delete := false;
+
+        # Add new file as child (relative name) to parent directory 
+        inode_data(file_data(dir_name).inode).dir_entries(base_name).inode := file_data(pathname).inode;
+      };        
+
+      if ((flags & O_TRUNC) == O_TRUNC) then {
+        inode_data(file_data(pathname).inode).sz := 0;
+      };
+
+      inode_data(file_data(pathname).inode).open_fd_count := (inode_data(file_data(pathname).inode).open_fd_count + 1);
+
+      file_state(res).off := 0;
+      file_state(res).flags := flags;    
+      file_state(res).inode := file_data(pathname).inode;
+      file_state(res).pathname := pathname;    
+
+      return res;
+    };
+
+    };
+    };
+    };
+    };    
+  };
+  };
+}
+
+action mkdir(path: string, mode: mode_t) returns (res: int) 
+  fuzz { res == -EACCES || res == -EEXIST || res == -EFAULT ||
+  res == -EINVAL || res == -ELOOP || res == -ENAMETOOLONG || res == -ENOENT ||
+  res == -ENOTDIR || res == 0 ||
+  res == 2147483647 || res == -2147483648 }
+  := {
+  let pathname:char[](PATH_MAX) in {
+  # CAN_ALL_BUT_LAST = Check ignoring ENOENT if the last component doesn't exist
+  let path_valid := extern call canonicalize_filename_mode1(path, CAN_ALL_BUT_LAST, pathname, O_RDONLY) in {
+    if (path_valid != 0) then {
+      # error is set from path resolution code
+      return path_valid;
+    };
+
+    # pathname already exists (not necessarily as a directory).
+    if (file_data(pathname)) then {
+      return -EEXIST;
+    };
+
+    # Add new dir as child (relative name) to parent directory 
+    let dir_name:char[](PATH_MAX) in {
+    let base_name:char[](PATH_MAX) in {              
+    let x1 := extern call get_dirname(pathname, dir_name) in {
+    let x2 := extern call get_basename(pathname, base_name) in {
+
+      # Check write permissions to the parent folder
+      # if (process_state(0).uid != 0) then {
+        let access_valid := call access_internal(dir_name, W_OK) in {
+          if (access_valid != 0) then {
+            # NOTE: error should be set by the access action
+            return access_valid;
+          };
+        };
+      let res := extern call real_mkdir(path, mode) in {
+        requires (res == 0);
+
+        let statbuf: struct stat[](1000) in {
+          let retval := call find_inode(path, statbuf) in {          
+            file_data(pathname).inode := retval;
+          };
+        };
+
+        # file_data(pathname).inode := extern call gen_unique_id();
+
+        inode_data(file_data(pathname).inode).link_count := 2;
+        inode_data(file_data(pathname).inode).mode := (S_IFDIR | (mode & ~(process_state(0).umask)));      
+
+        inode_data(file_data(pathname).inode).uid := process_state(0).uid;
+        inode_data(file_data(pathname).inode).gid := process_state(0).gid;
+        inode_data(file_data(pathname).inode).sz := 4096;
+        inode_data(file_data(pathname).inode).num_tags := 0;
+        inode_data(file_data(pathname).inode).num_ivs := 0;
+
+        inode_data(file_data(pathname).inode).open_fd_count := 0;
+        inode_data(file_data(pathname).inode).to_delete := false;
+
+        inode_data(file_data(dir_name).inode).dir_entries(base_name).inode := file_data(pathname).inode;
+
+        # Set . and .. for the directory as children
+        inode_data(file_data(pathname).inode).dir_entries(".").inode := file_data(pathname).inode;
+        inode_data(file_data(pathname).inode).dir_entries("..").inode := file_data(dir_name).inode;
+
+        # Update link count for base dir
+        inode_data(file_data(dir_name).inode).link_count := (inode_data(file_data(dir_name).inode).link_count + 1);  
+
+        return res;
+      };
+    };
+    };
+    };
+    };
+  };
+  };
+
+  requires (false);
+  return -1;
+}
+
+action chdir(path: string) returns (res:int) 
+  fuzz { res == -EACCES || res == -EFAULT || res == ELOOP || 
+  res == -ENAMETOOLONG || res == -ENOENT || res == -ENOTDIR || res == 0 ||
+  res == 2147483647 || res == -2147483648 }
+  := {
+  let pathname:char[](PATH_MAX) in {
+  # CAN_EXISTING = every component must exist
+  let path_valid := extern call canonicalize_filename_mode1(path, CAN_EXISTING, pathname, O_RDONLY) in {
+    if (path_valid != 0) then {
+      # error val is set from path resolution code
+      return path_valid;
+    };
+
+    # pathname already exists (not necessarily as a directory).
+    if (file_data(pathname)) then {
+      return -EEXIST;
+    };
+
+    let res := extern call real_chdir(path) in {
+      requires (res == 0);
+      process_state(0).cwd := pathname;
+      return res;
+    };
+  };
+  };
+
+  requires (false);
+  return -1;
+}
+
+action pwrite(fd: int, buf: char[], cnt: size_t, off: off_t) returns (res:ssize_t) 
+  fuzz { res == -EBADF || res == -EFAULT || res == -EINVAL || res >= 0 ||
+  res == 2147483647 || res == -2147483648 || res == (cnt+1) ||
+  buf[0:res] == 0 }
+  := {
+  if (!file_state(fd)) then {
+    return -EBADF;
+  };
+
+  if (
+      ((file_state(fd).flags & O_DIRECT) == O_DIRECT) && 
+      (((baseaddr(buf) % BLK_SIZE) != 0) || ((cnt % BLK_SIZE) != 0) || ((off % BLK_SIZE) != 0))
+     ) then {
+    return -EINVAL;
+  };
+
+  let res := extern call real_pwrite(fd, buf, cnt, off) in {
+    # requires (res >= 0);
+    requires (res <= cnt);
+
+    if (off > inode_data(file_state(fd).inode).sz) then {
+      inode_data(file_state(fd).inode).content[inode_data(file_state(fd).inode).sz:off] := 0;
+    };
+
+    inode_data(file_state(fd).inode).content[off:(off+res)] := buf[0:res];
+
+    if (inode_data(file_state(fd).inode).sz < (off+res)) then {
+      inode_data(file_state(fd).inode).sz := (off+res);
+    };
+
+    return res;
+  };
+}
+
+action pread(fd: int, buf: char[], cnt: size_t, off: off_t) returns (res:ssize_t) 
+  fuzz { res == -EBADF || res == -EFAULT || res == -EINVAL || res >= 0 ||
+  res == 2147483647 || res == -2147483648 || res == (cnt+1) || buf[0:1] == 0 }
+  := {
+  if (!file_state(fd)) then {
+    return -EBADF;
+  };
+
+  if (
+      ((file_state(fd).flags & O_DIRECT) == O_DIRECT) && 
+      (((baseaddr(buf) % BLK_SIZE) != 0) || ((cnt % BLK_SIZE) != 0) || ((off % BLK_SIZE) != 0))
+     ) then {
+    return -EINVAL;
+  };
+
+  let res := extern call real_pread(fd, buf, cnt, off) in {
+    requires ((cnt < (inode_data(file_state(fd).inode).sz - off)) -> res == cnt);
+    requires ((cnt >= (inode_data(file_state(fd).inode).sz - off)) -> res == (inode_data(file_state(fd).inode).sz - off));
+    requires (inode_data(file_state(fd).inode).content[off:(off+res)] == buf[0:res]);
+
+    return res;
+  };
+}
+
+action read(fd: int, buf: char[], cnt: size_t) returns (res:ssize_t) 
+  fuzz { res == -EBADF || res == -EFAULT || res == -EINVAL || res >= 0 ||
+  res == 2147483647 || res == -2147483648 || res == (cnt+1) || buf[0:1] == 0 }
+  := {
+  let res := call pread(fd, buf, cnt, file_state(fd).off) in {
+    if (res >= 0) then {
+      # Update the cursor
+      file_state(fd).off := (file_state(fd).off + res);
+    };
+
+    return res;
+  };
+}
+
+action write(fd: int, buf: char[], cnt: size_t) returns (res:ssize_t) 
+  fuzz { res == -EBADF || res == -EFAULT || res == -EINVAL || res >= 0 ||
+  res == 2147483647 || res == -2147483648 || res == (cnt+1) || buf[0:1] == 0 }
+  := {
+  if (!file_state(fd)) then {
+    return -EBADF;
+  };
+
+  if (((file_state(fd).flags & O_APPEND) == O_APPEND)) then {
+    let res := call pwrite(fd, buf, cnt, inode_data(file_state(fd).inode).sz) in {
+      if (res >= 0) then {
+        # Update the cursor
+        file_state(fd).off := (inode_data(file_state(fd).inode).sz + res);
+      };
+
+      return res;
+    };  
+  };
+
+  let res := call pwrite(fd, buf, cnt, file_state(fd).off) in {
+    if (res >= 0) then {
+      # Update the cursor
+      file_state(fd).off := (file_state(fd).off + res);
+    };
+
+    return res;
+  };
+}
+
+action close(fd: int) returns (res:int) 
+  fuzz { res == -EBADF || res == 0 ||
+  res == 2147483647 || res == -2147483648 } 
+  := {
+  if (!file_state(fd)) then {
+    return -EBADF;
+  };
+
+  let res := extern call real_close(fd) in {
+    requires (res == 0);
+    inode_data(file_state(fd).inode).open_fd_count := (inode_data(file_state(fd).inode).open_fd_count-1);
+    if (inode_data(file_state(fd).inode).to_delete == true && 
+        inode_data(file_state(fd).inode).open_fd_count == 0) then {
+      delete inode_data(file_state(fd).inode);
+    };
+
+    delete file_state(fd);
+
+    # open_files_state(fd).dummy := 0;
+    return res;
+  };
+}
+
+action lseek(fd: int, offset: off_t, whence: int) returns (res: off_t) 
+  fuzz { res == -EBADF || res == -EINVAL || res >= 0 ||
+  res == 2147483647 || res == -2147483648 }
+  := {
+  if (!file_state(fd)) then {
+    return -EBADF;
+  };
+
+  # NOTE: this is actually a partial spec for EINVAL since it misses handling of sparse files
+  # I.e., (whence == SEEK_DATA || whence == SEEK_HOLE);
+  if (whence == SEEK_SET && offset < 0) then {
+    return -EINVAL;
+  };
+
+  if (whence == SEEK_CUR && (file_state(fd).off + offset) < 0) then {
+    return -EINVAL;
+  };
+
+  if (whence == SEEK_END && (inode_data(file_state(fd).inode).sz + offset) < 0) then {
+    return -EINVAL;
+  };
+
+  if (whence == SEEK_END && ((inode_data(file_state(fd).inode).mode & S_IFDIR) == S_IFDIR)) then {
+    return -EOVERFLOW;
+  };
+
+  let res := extern call real_lseek(fd, offset, whence) in {
+    if (whence == SEEK_SET) then {
+      file_state(fd).off := offset;       
+    };
+    if (whence == SEEK_CUR) then {
+      file_state(fd).off := (file_state(fd).off + offset); 
+    };
+    if (whence == SEEK_END) then {
+      file_state(fd).off := (inode_data(file_state(fd).inode).sz + offset); 
+    };
+
+    requires (res == file_state(fd).off);
+ 
+    return res;
+  };
+}
+
+action unlink(path: string) returns (res: int) 
+  fuzz { res == -EACCES || res == -EFAULT || res == -EISDIR || 
+  res == -ELOOP || res == -ENAMETOOLONG || res == -ENOENT ||
+  res == -ENOTDIR || res == 0 || res == 2147483647 || res == -2147483648 } 
+  := {
+  let pathname:char[](PATH_MAX) in {
+  let path_valid := extern call canonicalize_filename_mode1(path, CAN_NOLINK_LAST, pathname, O_RDONLY) in {
+    if (path_valid != 0) then {
+      return path_valid;
+    };
+
+    if (!file_data(pathname)) then {
+      return -ENOENT;
+    };
+
+    if ((inode_data(file_data(pathname).inode).mode & S_IFDIR) == S_IFDIR) then {
+      # NOTE: Linux returns EISDIR, POSIX says we should return EPERM
+      return -EISDIR;
+    };
+
+    # EACCES
+
+    let res := extern call real_unlink(path) in {
+      requires (res == 0);
+
+      # Remove from parent in any case
+      let dir_name:char[](PATH_MAX) in {
+      let base_name:char[](PATH_MAX) in {              
+      let x1 := extern call get_dirname(pathname, dir_name) in {
+      let x2 := extern call get_basename(pathname, base_name) in {
+        delete inode_data(file_data(dir_name).inode).dir_entries(base_name);
+      };
+      };
+      };
+      };
+
+      if (inode_data(file_data(pathname).inode).link_count == 1) then {
+        if (inode_data(file_data(pathname).inode).open_fd_count == 0) then {
+          delete inode_data(file_data(pathname).inode);
+        } else {
+          inode_data(file_data(pathname).inode).to_delete := true;
+        };
+      } else {
+        inode_data(file_data(pathname).inode).link_count := (inode_data(file_data(pathname).inode).link_count - 1);
+      };
+
+      delete file_data(pathname);
+
+      return res;
+    };
+  };
+  };
+}
+
+action lstat(path: string, statbuf: struct stat[]) returns (res: int) 
+  fuzz { res == -EACCES || res == -EFAULT || res == -EINVAL ||
+  res == -ELOOP || res == -ENAMETOOLONG || res == -ENOENT ||
+  res == -ENOTDIR || res == 0 || res == 2147483647 || res == -2147483648 ||
+  statbuf[0].st_size == -1 || statbuf[0].st_size == 2147483647 ||
+  statbuf[0].st_size == -2147483647 || statbuf[0].st_uid == 0 ||
+  statbuf[0].st_gid == 0 || statbuf[0].st_mode == (S_IFDIR | 0775) ||
+  statbuf[0].st_mode == (S_IFLNK | 0775) }
+  := {
+
+  let pathname:string(PATH_MAX) in {
+  let path_valid := extern call canonicalize_filename_mode1(path, CAN_NOLINK_LAST, pathname, O_RDONLY) in {
+    if (path_valid != 0) then {
+      return path_valid;
+    };
+
+    if (!file_data(pathname)) then {
+      return -ENOENT;
+    };
+
+    let res := extern call real_lstat(path, statbuf) in {
+      res := 0;
+      requires (res == 0);
+      requires (inode_data(file_data(pathname).inode).sz == statbuf[0].st_size);
+      requires (inode_data(file_data(pathname).inode).uid == statbuf[0].st_uid);
+      requires (inode_data(file_data(pathname).inode).gid == statbuf[0].st_gid);
+      requires (inode_data(file_data(pathname).inode).link_count == statbuf[0].st_nlink);
+      requires (inode_data(file_data(pathname).inode).mode == statbuf[0].st_mode);
+      requires (file_data(pathname).inode == statbuf[0].st_ino);
+      requires (statbuf[0].st_blksize == BLK_SIZE);
+      # NOTE: no requirements for: st_dev (not modeled), and st_blocks: should be sz/512, but this doens't seem to be the case for ext4 so can't require it =(
+      return res;
+    };
+  };
+  };
+}
+
+action fstat(fd: int, statbuf: struct stat[]) returns (res: int) 
+  fuzz { res == -EBADF || res == -EFAULT || res == -EINVAL || res == 0
+  || res == 2147483647 || res == -2147483648 ||
+  statbuf[0].st_size == -1 || statbuf[0].st_size == 2147483647 ||
+  statbuf[0].st_size == -2147483647 || statbuf[0].st_uid == 0 ||
+  statbuf[0].st_gid == 0 || statbuf[0].st_mode == (S_IFDIR | 0775) ||
+  statbuf[0].st_mode == (S_IFLNK | 0775) }
+  := {
+    if (!file_state(fd)) then {
+      return -EBADF;
+    };
+
+    let res := extern call real_fstat(fd, statbuf) in {
+      requires (res == 0);
+      requires (inode_data(file_state(fd).inode).sz == statbuf[0].st_size);
+      requires (inode_data(file_state(fd).inode).uid == statbuf[0].st_uid);
+      requires (inode_data(file_state(fd).inode).gid == statbuf[0].st_gid);
+      requires (inode_data(file_state(fd).inode).link_count == statbuf[0].st_nlink);
+      requires (inode_data(file_state(fd).inode).mode == statbuf[0].st_mode);
+      requires (file_state(fd).inode == statbuf[0].st_ino);
+      requires (statbuf[0].st_blksize == BLK_SIZE);
+      # NOTE: no requirements for: st_dev (not modeled), and st_blocks: should be sz/512, but this doens't seem to be the case for ext4 so can't require it =(
+      return res;
+    };
+}
+
+action access(path: string, mode: int) returns (res: int) 
+  fuzz { res == -EACCES || res == -EFAULT || res == -EINVAL ||
+  res == -ELOOP || res == -ENAMETOOLONG || res == -ENOENT ||
+  res == -ENOTDIR || res == 0 ||
+  res == 2147483647 || res == -2147483648 }
+  := {
+  if ((mode != F_OK) && ((mode & R_OK) != R_OK) && ((mode & W_OK) != W_OK) && ((mode & X_OK) != X_OK)) then {
+    return -EINVAL;
+  };
+
+  let pathname:char[](PATH_MAX) in {
+  let path_valid := extern call canonicalize_filename_mode1(path, CAN_EXISTING, pathname, O_RDONLY) in {
+    if (path_valid != 0) then {
+      return path_valid;
+    };
+
+    if (mode == F_OK) then {
+      if (file_data(pathname)) then {
+        return 0;
+      }; 
+
+      return -EACCES;
+    };
+
+    # File not exists.
+    if (!file_data(pathname)) then {
+      return -ENOENT;
+    };
+
+    if (process_state(0).uid == 0) then {
+      return 0;
+    };
+
+    if (inode_data(file_data(pathname).inode).uid == process_state(0).uid) then {
+      if (((mode & R_OK) == R_OK) && ((inode_data(file_data(pathname).inode).mode & S_IRUSR) != S_IRUSR)) then {
+        return -EACCES;
+      };
+
+      if (((mode & W_OK) == W_OK) && ((inode_data(file_data(pathname).inode).mode & S_IWUSR) != S_IWUSR)) then {
+        return -EACCES;
+      };
+
+      if (((mode & X_OK) == X_OK) && ((inode_data(file_data(pathname).inode).mode & S_IXUSR) != S_IXUSR)) then {
+        return -EACCES;
+      };
+
+      return 0;
+    };
+    
+    if (inode_data(file_data(pathname).inode).gid == process_state(0).gid) then {
+      if (((mode & R_OK) == R_OK) && ((inode_data(file_data(pathname).inode).mode & S_IRGRP) != S_IRGRP)) then {
+        return -EACCES;
+      };
+
+      if (((mode & W_OK) == W_OK) && ((inode_data(file_data(pathname).inode).mode & S_IWGRP) != S_IWGRP)) then {
+        return -EACCES;
+      };
+
+      if (((mode & X_OK) == X_OK) && ((inode_data(file_data(pathname).inode).mode & S_IXGRP) != S_IXGRP)) then {
+        return -EACCES;
+      };
+
+      return 0;
+    };
+
+    let supp_group := extern call is_in_supp_groups(inode_data(file_data(pathname).inode).gid, process_state(0).supp_groups, process_state(0).num_supp_groups) in {
+      if (supp_group == true) then {
+        if (((mode & R_OK) == R_OK) && ((inode_data(file_data(pathname).inode).mode & S_IRGRP) != S_IRGRP)) then {
+          return -EACCES;
+        };
+
+        if (((mode & W_OK) == W_OK) && ((inode_data(file_data(pathname).inode).mode & S_IWGRP) != S_IWGRP)) then {
+          return -EACCES;
+        };
+
+        if (((mode & X_OK) == X_OK) && ((inode_data(file_data(pathname).inode).mode & S_IXGRP) != S_IXGRP)) then {
+          return -EACCES;
+        };
+
+        return 0;
+      };
+    };
+
+    # others
+    if (((mode & R_OK) == R_OK) && ((inode_data(file_data(pathname).inode).mode & S_IROTH) != S_IROTH)) then {
+      return -EACCES;
+    };
+
+    if (((mode & W_OK) == W_OK) && ((inode_data(file_data(pathname).inode).mode & S_IWOTH) != S_IWOTH)) then {
+      return -EACCES;
+    };
+
+    if (((mode & X_OK) == X_OK) && ((inode_data(file_data(pathname).inode).mode & S_IXOTH) != S_IXOTH)) then {
+      return -EACCES;
+    };
+
+    return 0;
+  };
+  };
+}
+
+action access_internal(pathname: string, mode: int) returns (res: int) 
+  fuzz { res == -EACCES || res == -EFAULT || res == -EINVAL ||
+  res == -ELOOP || res == -ENAMETOOLONG || res == -ENOENT ||
+  res == -ENOTDIR || res == 0 }
+  := {
+  if ((mode != F_OK) && ((mode & R_OK) != R_OK) && ((mode & W_OK) != W_OK) && ((mode & X_OK) != X_OK)) then {
+    return -EINVAL;
+  };
+
+  if (mode == F_OK) then {
+    if (file_data(pathname)) then {
+      return 0;
+    }; 
+
+    return -EACCES;
+  };
+
+  # File not exists.
+  if (!file_data(pathname)) then {
+    return -ENOENT;
+  };
+
+  if (process_state(0).uid == 0) then {
+    return 0;
+  };
+
+  if (inode_data(file_data(pathname).inode).uid == process_state(0).uid) then {
+    if (((mode & R_OK) == R_OK) && ((inode_data(file_data(pathname).inode).mode & S_IRUSR) != S_IRUSR)) then {
+      return -EACCES;
+    };
+
+    if (((mode & W_OK) == W_OK) && ((inode_data(file_data(pathname).inode).mode & S_IWUSR) != S_IWUSR)) then {
+      return -EACCES;
+    };
+
+    if (((mode & X_OK) == X_OK) && ((inode_data(file_data(pathname).inode).mode & S_IXUSR) != S_IXUSR)) then {
+      return -EACCES;
+    };
+
+    return 0;
+  };
+  
+  if (inode_data(file_data(pathname).inode).gid == process_state(0).gid) then {
+    if (((mode & R_OK) == R_OK) && ((inode_data(file_data(pathname).inode).mode & S_IRGRP) != S_IRGRP)) then {
+      return -EACCES;
+    };
+
+    if (((mode & W_OK) == W_OK) && ((inode_data(file_data(pathname).inode).mode & S_IWGRP) != S_IWGRP)) then {
+      return -EACCES;
+    };
+
+    if (((mode & X_OK) == X_OK) && ((inode_data(file_data(pathname).inode).mode & S_IXGRP) != S_IXGRP)) then {
+      return -EACCES;
+    };
+
+    return 0;
+  };
+
+  let supp_group := extern call is_in_supp_groups(inode_data(file_data(pathname).inode).gid, process_state(0).supp_groups, process_state(0).num_supp_groups) in {
+    if (supp_group == true) then {
+      if (((mode & R_OK) == R_OK) && ((inode_data(file_data(pathname).inode).mode & S_IRGRP) != S_IRGRP)) then {
+        return -EACCES;
+      };
+
+      if (((mode & W_OK) == W_OK) && ((inode_data(file_data(pathname).inode).mode & S_IWGRP) != S_IWGRP)) then {
+        return -EACCES;
+      };
+
+      if (((mode & X_OK) == X_OK) && ((inode_data(file_data(pathname).inode).mode & S_IXGRP) != S_IXGRP)) then {
+        return -EACCES;
+      };
+
+      return 0;
+    };
+  };
+
+  # others
+  if (((mode & R_OK) == R_OK) && ((inode_data(file_data(pathname).inode).mode & S_IROTH) != S_IROTH)) then {
+    return -EACCES;
+  };
+
+  if (((mode & W_OK) == W_OK) && ((inode_data(file_data(pathname).inode).mode & S_IWOTH) != S_IWOTH)) then {
+    return -EACCES;
+  };
+
+  if (((mode & X_OK) == X_OK) && ((inode_data(file_data(pathname).inode).mode & S_IXOTH) != S_IXOTH)) then {
+    return -EACCES;
+  };
+
+  return 0;
+}
+
+action getdents64(fd: uint, buf: char[], count: uint) returns (res: int) 
+  fuzz { res == -EBADF || res == -EFAULT ||
+  res == -EINVAL || res == -ENOENT ||
+  res == -ENOTDIR || res >= 0 ||
+  res == 2147483647 || res == -2147483648 ||
+  res == 24 # || buf[0:res] == 0 || buf[res:(2*res)] == buf[0:res]
+  }
+  := 
+{
+  if (!file_state(fd)) then {
+    return -EBADF;
+  };
+
+  if ((inode_data(file_state(fd).inode).mode & S_IFDIR) != S_IFDIR) then {
+    return -ENOTDIR;
+  };
+  
+  let res := extern call real_getdents64(fd, buf, count) in {
+    # validate requires loops - use external C code for that. 
+    # NOTE: this means we can't verify this method with our backend.
+    # NOTE2: This will inovke other actions buffer by buffer for correct name, etc.
+    seen_dirs(fd).inode := file_state(fd).inode;
+
+    let retval := extern call validate_getdents64(fd, buf, count) in {            
+      requires (res == retval);      
+      delete seen_dirs(fd);
+      return retval;
+    };
+  };
+}
+
+action readlink_final(pathname: string, buf: char[], bufsiz: size_t, final: bool, unlink_last: bool) returns (res: ssize_t) := {
+  if (!file_data(pathname)) then {
+    return -ENOENT;
+  };
+
+  if (!final) then {
+    # Check permissions (only if not root capabilities):
+    let access_valid := call access_internal(pathname, X_OK) in {
+      if (access_valid != 0) then {
+        # NOTE: error should be set by the access action
+        return access_valid;
+      };
+    };
+
+    if ((inode_data(file_data(pathname).inode).mode & S_IFDIR) != S_IFDIR) then {
+      return -ENOTDIR;
+    };
+  };
+
+  # Otherwise, actually last file, check that it's indeed a symlink
+  if (bufsiz <= 0) then {
+    return -EINVAL;
+  };
+
+  if (unlink_last == false) then {
+    return -EINVAL;
+  };
+
+  if ((inode_data(file_data(pathname).inode).mode & S_IFLNK) != S_IFLNK) then {
+    return -EINVAL;
+  };
+  
+  
+ buf[0:(inode_data(file_data(pathname).inode).sz+1)] := inode_data(file_data(pathname).inode).symlink_val[0:(inode_data(file_data(pathname).inode).sz+1)];
+}
+
+action readlink(path: string, buf: char[], bufsiz: size_t) returns (res: ssize_t) 
+  fuzz { res == -EACCES || res == -EFAULT || res == -EINVAL ||
+  res == -ELOOP || res == -ENAMETOOLONG || res == -ENOENT ||
+  res == -ENOTDIR || res >= 0 || 
+  res == 2147483647 || res == -2147483648 ||
+  res == (bufsiz + 1) || res == bufsiz }
+  := {
+  if (bufsiz <= 0) then {
+    return -EINVAL;
+  };
+
+  let pathname:char[](PATH_MAX) in {
+  let path_valid := extern call canonicalize_filename_mode1(path, CAN_NOLINK_LAST, pathname, O_RDONLY) in {
+    if (path_valid != 0) then {
+      # error val is set from path resolution code
+      return path_valid;
+    };
+
+    if ((inode_data(file_data(pathname).inode).mode & S_IFLNK) != S_IFLNK) then {
+      return -EINVAL;
+    };
+    
+    let res := extern call real_readlink(path, buf, bufsiz) in {
+      requires (inode_data(file_data(pathname).inode).sz < bufsiz -> res == inode_data(file_data(pathname).inode).sz);
+      requires (inode_data(file_data(pathname).inode).sz >= bufsiz -> res == bufsiz);
+      # requires (res > 0 && res <= bufsiz);
+      # requires (res <= inode_data(file_data(pathname).inode).sz);
+      requires (buf[0:res] == inode_data(file_data(pathname).inode).symlink_val[0:res]);
+      # requires (buf[0:bufsiz] == inode_data(file_data(pathname).inode).symlink_val[0:bufsiz]);
+      return res;
+    };
+  };
+  };
+}
+
+action rmdir(path: string) returns (res: int) 
+  fuzz { res == -EACCES || res == -EFAULT || res == -EINVAL ||
+  res == -ELOOP || res == -ENAMETOOLONG || res == -ENOENT || res == -ENOTEMPTY ||
+  res == -ENOTDIR || res == 0 || 
+  res == 2147483647 || res == -2147483648 }
+  := {
+  let pathname:string(PATH_MAX) in {
+  let path_valid := extern call canonicalize_filename_mode1(path, CAN_EXISTING, pathname, O_RDONLY) in {
+    if (path_valid != 0) then {
+      # error val is set from path resolution code
+      return path_valid;
+    };
+
+    if (pathname == "/") then {
+      return -EBUSY;    
+    };
+
+    if ((inode_data(file_data(pathname).inode).mode & S_IFDIR) != S_IFDIR) then {
+      return -ENOTDIR;
+    };
+
+    if (exists r in inode_data(file_data(pathname).inode).dir_entries :: 
+        (r != "." && r != "..")
+       ) then {
+      return -ENOTEMPTY;
+    };
+
+    let dir_name:char[](PATH_MAX) in {
+    let base_name:char[](PATH_MAX) in {              
+    let x1 := extern call get_dirname(pathname, dir_name) in {
+    let x2 := extern call get_basename(pathname, base_name) in {
+
+    # Sticky bit: The  directory containing pathname has the sticky bit (S_ISVTX) set 
+    # and the process's effective user ID is neither the user ID of the file to be deleted 
+    # nor that of the directory containing it, and the process is not privileged
+    if (((inode_data(file_data(dir_name).inode).mode & S_ISVTX) == S_ISVTX) &&
+      (process_state(0).uid != 0) && 
+      (process_state(0).uid != inode_data(file_data(pathname).inode).uid) &&
+      (process_state(0).uid != inode_data(file_data(dir_name).inode).uid)
+    ) then {
+      return -EPERM;
+    };
+
+  let res := extern call real_rmdir(path) in {
+    requires (res == 0);
+      # Remove from parent
+      delete inode_data(file_data(dir_name).inode).dir_entries(base_name);
+      # Decrease parent link count (no more '..' link)
+      inode_data(file_data(dir_name).inode).link_count := (inode_data(file_data(dir_name).inode).link_count - 1);
+      requires (inode_data(file_data(dir_name).inode).link_count >= 0);
+
+    # Delete from file_data (FIXME: compiler should delete internal relations correctly)
+    delete inode_data(file_data(pathname).inode);
+    delete file_data(pathname);
+
+    return res;
+  };
+  };
+  };
+  };
+  };
+  };
+  };
+}
+
+action symlink(target: string, linkpath: string) returns (res: int) 
+  fuzz { res == -EACCES || res == -EFAULT || res == -EINVAL ||
+  res == -ELOOP || res == -ENAMETOOLONG || res == -ENOENT || 
+  res == -ENOTDIR || res == 0 || 
+  res == 2147483647 || res == -2147483648 }
+  := {
+  # let target_pathname:char[](PATH_MAX) in {
+  let link_pathname:char[](PATH_MAX) in {
+   
+  let link_path_valid := extern call canonicalize_filename_mode1(linkpath, CAN_MISSING, link_pathname, O_RDONLY) in {
+    if (link_path_valid != 0) then {
+      return link_path_valid;
+    };
+
+    if (file_data(link_pathname)) then {
+      return -EEXIST;
+    };
+
+    let res := extern call real_symlink(target, linkpath) in {
+      requires (res == 0);
+
+      let statbuf: struct stat[](1000) in {
+        let retval := call find_inode(linkpath, statbuf) in {          
+          file_data(link_pathname).inode := retval;
+        };
+      };
+
+      # file_data(link_pathname).inode := extern call gen_unique_id();      
+
+      inode_data(file_data(link_pathname).inode).symlink_val := target;
+      inode_data(file_data(link_pathname).inode).uid := process_state(0).uid;
+      inode_data(file_data(link_pathname).inode).gid := process_state(0).gid;
+      inode_data(file_data(link_pathname).inode).link_count := 1;
+      inode_data(file_data(link_pathname).inode).mode := (S_IFLNK | 0777);
+      inode_data(file_data(link_pathname).inode).sz := extern call strlen(target);
+
+      inode_data(file_data(link_pathname).inode).open_fd_count := 0;
+      inode_data(file_data(link_pathname).inode).to_delete := false;
+
+      # Add new file as child (relative name) to parent directory 
+      let dir_name:char[](PATH_MAX) in {
+      let base_name:char[](PATH_MAX) in {              
+      let x1 := extern call get_dirname(link_pathname, dir_name) in {
+      let x2 := extern call get_basename(link_pathname, base_name) in {
+        inode_data(file_data(dir_name).inode).dir_entries(base_name).inode := file_data(link_pathname).inode;
+      };
+      };
+      };
+      };
+
+      return res;
+    };
+  };
+  };
+  # };
+  # };
+}
+
+action rename(oldpath: string, newpath: string) returns (res: int) 
+  fuzz { res == -EACCES || res == -EFAULT || res == -EINVAL ||
+  res == -ELOOP || res == -ENAMETOOLONG || res == -ENOENT || res == -ENOTEMPTY ||
+  res == -ENOTDIR || res == 0 || 
+  res == 2147483647 || res == -2147483648 } 
+  := {
+  if (oldpath == "/") then {
+    return -EBUSY;
+  };
+
+  if (newpath == "/") then {
+    return -EBUSY;
+  };
+
+
+  let oldpathname:string(PATH_MAX) in {
+  let newpathname:string(PATH_MAX) in {
+  let oldpath_valid := extern call canonicalize_filename_mode1(oldpath, CAN_NOLINK_LAST, oldpathname, O_RDONLY) in {
+    if (oldpath_valid != 0) then {
+      return oldpath_valid;
+    };
+
+  let newpath_valid := extern call canonicalize_filename_mode1(newpath, CAN_ALL_BUT_LAST_NOLINK_LAST, newpathname, O_RDONLY) in {
+    if (newpath_valid != 0) then {
+      return newpath_valid;
+    };
+
+    if (process_state(0).cwd == oldpathname) then {
+      return -EBUSY;
+    };
+
+    if (process_state(0).cwd == newpathname) then {
+      return -EBUSY;
+    };
+
+    if (file_data(newpathname)) then {
+      if (
+          ((inode_data(file_data(newpathname).inode).mode & S_IFDIR) == S_IFDIR) &&
+          ((inode_data(file_data(oldpathname).inode).mode & S_IFDIR) != S_IFDIR)
+        ) then {
+        return -EISDIR;
+      };
+
+      if (
+          ((inode_data(file_data(newpathname).inode).mode & S_IFDIR) != S_IFDIR) &&
+          ((inode_data(file_data(oldpathname).inode).mode & S_IFDIR) == S_IFDIR)
+        ) then {
+        return -ENOTDIR;
+      };
+
+      if (
+        (exists r in inode_data(file_data(newpathname).inode).dir_entries :: 
+          (r != "." && r != ".."))
+      ) then {
+        return -ENOTEMPTY;
+      };
+
+    };
+
+
+
+
+    # NOTE: check write permission for dirname of oldpath,newpath -> EACCES
+    let olddir_name:char[](PATH_MAX) in {
+    let oldbase_name:char[](PATH_MAX) in {              
+    let newdir_name:char[](PATH_MAX) in {
+    let newbase_name:char[](PATH_MAX) in {              
+    let x1 := extern call get_dirname(oldpathname, olddir_name) in {
+    let x2 := extern call get_basename(oldpathname, oldbase_name) in {
+    let x3 := extern call get_dirname(newpathname, newdir_name) in {
+    let x4 := extern call get_basename(newpathname, newbase_name) in {
+      
+      # Sticky bit: The  directory  containing oldpath has the sticky bit (S_ISVTX) set and the 
+      # process's effective user ID is neither the user ID of the file to be deleted nor 
+      # that of the directory containing it, and the process is not privileged
+      if (((inode_data(file_data(oldpathname).inode).mode & S_ISVTX) == S_ISVTX) &&
+        (process_state(0).uid != 0) && 
+        (process_state(0).uid != inode_data(file_data(oldpathname).inode).uid) &&
+        (process_state(0).uid != inode_data(file_data(olddir_name).inode).uid)
+      ) then {
+        return -EPERM;
+      };
+
+      if ((file_data(newpathname)) && 
+         ((inode_data(file_data(newdir_name).inode).mode & S_ISVTX) == S_ISVTX) && 
+        (process_state(0).uid != inode_data(file_data(oldpathname).inode).uid) &&
+        (process_state(0).uid != inode_data(file_data(olddir_name).inode).uid)
+        ) then {
+        return -EPERM;
+      };
+
+    # Check write permission
+    let old_access_valid := call access_internal(olddir_name, W_OK) in {
+      if (old_access_valid != 0) then {
+        # NOTE: error should be set by the access action
+        return old_access_valid;
+      };
+    };
+ 
+    let new_access_valid := call access_internal(newdir_name, W_OK) in {
+      if (new_access_valid != 0) then {
+        # NOTE: error should be set by the access action
+        return new_access_valid;
+      };
+    };
+
+    if ((inode_data(file_data(oldpathname).inode).mode & S_IFDIR) == S_IFDIR) then {
+      # update child pathnames
+      extern call rename_children_paths(oldpathname, newpathname);
+    };
+
+    let res := extern call real_rename(oldpath, newpath) in {
+      requires (res == 0);
+
+      if ((file_data(newpathname)) && (file_data(newpathname).inode == file_data(oldpathname).inode)) then {
+        # If oldpath and newpath are existing hard links referring to the same file, then rename() does nothing.
+        return res;
+      };
+
+
+      # if newpath exist - delete it first
+      if (file_data(newpathname)) then {
+          if ((inode_data(file_data(newpathname).inode).mode & S_IFDIR) == S_IFDIR) then {
+            inode_data(file_data(newdir_name).inode).link_count := (inode_data(file_data(newdir_name).inode).link_count - 1);
+            delete inode_data(file_data(newpathname).inode);
+          } else {        
+            if (inode_data(file_data(newpathname).inode).link_count == 1) then {
+              if (inode_data(file_data(newpathname).inode).open_fd_count == 0) then {
+                delete inode_data(file_data(newpathname).inode);
+              } else {
+                inode_data(file_data(newpathname).inode).to_delete := true;
+              };
+            } else {
+              inode_data(file_data(newpathname).inode).link_count := (inode_data(file_data(newpathname).inode).link_count - 1);
+            };
+          };
+
+          # NOTE: no need to actually delete it since we will overwrite it next.
+          # delete file_data(newpathname); 
+      };
+
+      # Update inode for newpath
+      file_data(newpathname).inode := file_data(oldpathname).inode;
+
+      # Insert file to new dir
+      inode_data(file_data(newdir_name).inode).dir_entries(newbase_name).inode := file_data(newpathname).inode;
+
+      # If oldpathname is a directory - should update the ".."
+      if ((inode_data(file_data(oldpathname).inode).mode & S_IFDIR) == S_IFDIR) then {
+        inode_data(file_data(olddir_name).inode).link_count := (inode_data(file_data(olddir_name).inode).link_count - 1);
+        inode_data(file_data(newdir_name).inode).link_count := (inode_data(file_data(newdir_name).inode).link_count + 1);
+        inode_data(file_data(oldpathname).inode).dir_entries("..").inode := file_data(newdir_name).inode;        
+      };
+      
+      # Delete file from old dir
+      delete inode_data(file_data(olddir_name).inode).dir_entries(oldbase_name);
+
+      # Finally delete old path
+      delete file_data(oldpathname);
+
+      return res;
+    };
+    };
+    };
+    };
+    };
+    };
+    };
+    };
+    };  
+
+  };
+  };
+  };
+  };
+}
+
+action rename_pathname(oldpathname: string, newpathname: string) returns (res:void) := {  
+  file_data(newpathname).inode := file_data(oldpathname).inode;  
+
+  if ((inode_data(file_data(oldpathname).inode).mode & S_IFDIR) == S_IFDIR) then {
+    extern call rename_children_paths(oldpathname, newpathname);
+  };
+
+  # finally, delete
+  delete file_data(oldpathname);
+}
+
+action link(oldpath: string, newpath: string) returns (res: int) 
+  fuzz { res == -EACCES || res == -EFAULT || res == -EINVAL ||
+  res == -ELOOP || res == -ENAMETOOLONG || res == -ENOENT || res == -ENOTEMPTY ||
+  res == -ENOTDIR || res == 0 || 
+  res == 2147483647 || res == -2147483648 }
+  := {
+  let oldpathname:char[](PATH_MAX) in {
+  let newpathname:char[](PATH_MAX) in {
+  let oldpath_valid := extern call canonicalize_filename_mode1(oldpath, CAN_NOLINK_LAST, oldpathname, O_RDONLY) in {
+    if (oldpath_valid != 0) then {
+      return oldpath_valid;
+    };
+
+    if ((inode_data(file_data(oldpathname).inode).mode & S_IFDIR) == S_IFDIR) then {
+      return -EPERM;
+    };
+    
+  let newpath_valid := extern call canonicalize_filename_mode1(newpath, CAN_MISSING, newpathname, O_RDONLY) in {
+    if (newpath_valid != 0) then {
+      return newpath_valid;
+    };
+
+    if (file_data(newpathname)) then {
+      return -EEXIST;
+    };
+
+    let res := extern call real_link(oldpath, newpath) in {
+      requires (res == 0);
+      file_data(newpathname).inode := file_data(oldpathname).inode;
+      inode_data(file_data(oldpathname).inode).link_count := (inode_data(file_data(oldpathname).inode).link_count + 1);
+      # file_data(newpathname).open_fd_count := 0;
+      # file_data(newpathname).to_delete := false;
+
+      # Add new file as child (relative name) to parent directory 
+      let dir_name:char[](PATH_MAX) in {
+      let base_name:char[](PATH_MAX) in {              
+      let x1 := extern call get_dirname(newpathname, dir_name) in {
+      let x2 := extern call get_basename(newpathname, base_name) in {
+        inode_data(file_data(dir_name).inode).dir_entries(base_name).inode := file_data(newpathname).inode;
+      };
+      };
+      };
+      };
+
+      return res;
+    };
+  };
+  };
+  };
+  };
+}
+
+action fchmod(fd: int, mode: mode_t) returns (res: int) 
+  fuzz { res == -EBADF || res == -EPERM || res == 0 || 
+  res == 2147483647 || res == -2147483648 }
+  := {
+
+    if (!file_state(fd)) then {
+      return -EBADF;
+    };
+
+    if ((inode_data(file_state(fd).inode).uid != process_state(0).uid) && (process_state(0).uid != 0)) then {
+      return -EPERM;
+    };
+
+    let res := extern call real_fchmod(fd, mode) in {
+      requires (res == 0);
+      inode_data(file_state(fd).inode).mode := mode;
+
+      return res;
+    };
+}
+
+action chmod(path: string, mode: mode_t) returns (res: int) 
+  fuzz { res == -EACCES || res == -EFAULT || res == -EINVAL ||
+  res == -ELOOP || res == -ENAMETOOLONG || res == -ENOENT ||
+  res == -ENOTDIR || res == 0 || res == 2147483647 || res == -2147483648 }
+  := {
+  let pathname:char[](PATH_MAX) in {
+  let path_valid := extern call canonicalize_filename_mode1(path, CAN_EXISTING, pathname, O_RDONLY) in {
+    if (path_valid != 0) then {
+      return path_valid;
+    };
+
+    if ((inode_data(file_data(pathname).inode).uid != process_state(0).uid) && (process_state(0).uid != 0)) then {
+      return -EPERM;
+    };
+
+    let res := extern call real_chmod(path, mode) in {
+      requires (res == 0);
+      inode_data(file_data(pathname).inode).mode := mode;
+
+      return res;
+    };
+  };
+  };
+}
+
+action lchown(path: string, owner: uid_t, group: gid_t) returns (res: int) 
+  fuzz { res == -EACCES || res == -EFAULT || res == -EINVAL ||
+  res == -ELOOP || res == -ENAMETOOLONG || res == -ENOENT || 
+  res == -ENOTDIR || res == 0 || res == 2147483647 || res == -2147483648 } 
+  := {
+  let pathname:char[](PATH_MAX) in {
+  let path_valid := extern call canonicalize_filename_mode1(path, CAN_EXISTING, pathname, O_RDONLY) in {
+    if (path_valid != 0) then {
+      return path_valid;
+    };
+
+    if ((owner != -1) && (owner != inode_data(file_data(pathname).inode).uid) && (process_state(0).uid != 0)) then {
+      return -EPERM;
+    };
+
+    let res := extern call real_lchown(path, owner, group) in {
+      requires (res == 0);
+      # If the owner or group is specified as -1, then that ID is not changed.
+      if (owner != -1) then {
+        inode_data(file_data(pathname).inode).uid := owner;
+      };
+
+      if (group != -1) then {
+        inode_data(file_data(pathname).inode).gid := group;
+      };
+
+      return res;
+    };
+  };
+  };
+}
+
+action ftruncate(fd: int, length: off_t) returns (res: int) 
+  fuzz { res == -EBADF || res == -EINVAL || res == 0 ||
+  res == 2147483647 || res == -2147483648 } 
+  := {
+  if (length < 0 || length > process_state(0).max_file_size) then {
+    return -EINVAL;
+  };
+
+  if (!file_state(fd)) then {
+    return -EBADF;
+  };
+
+  if ( ((file_state(fd).flags & O_ACCMODE) != O_RDWR) && ((file_state(fd).flags & O_ACCMODE) != O_WRONLY) ) then {
+    #NOTE: POSIX specify it can be either EINVAL or EBADF actually.
+    return -EINVAL;
+  };  
+
+  if ((inode_data(file_state(fd).inode).mode & S_IFDIR) == S_IFDIR) then {
+    return -EISDIR;
+  };
+
+  let res := extern call real_ftruncate(fd, length) in {
+    requires (res == 0);
+    if (inode_data(file_state(fd).inode).sz >= length) then {
+      # truncate case: simply set size value, no need to discard old values actually
+      inode_data(file_state(fd).inode).sz := length;
+    } else {
+      # extend case: zero out bytes from old size to new size
+      inode_data(file_state(fd).inode).content[inode_data(file_state(fd).inode).sz:length] := 0;
+      inode_data(file_state(fd).inode).sz := length;
+    };
+    
+    return res;
+  };
+}
+
+action truncate(path: string, length: off_t) returns (res: int) 
+  fuzz { res == -EACCES || res == -EFAULT || res == -EINVAL ||
+  res == -ELOOP || res == -ENAMETOOLONG || res == -ENOENT || 
+  res == -ENOTDIR || res == -EISDIR || res == 0 || 
+  res == 2147483647 || res == -2147483648 } 
+  := {
+  if (length < 0 || length > process_state(0).max_file_size) then {
+    return -EINVAL;
+  };
+
+  let pathname:char[](PATH_MAX) in {
+  let path_valid := extern call canonicalize_filename_mode1(path, CAN_EXISTING, pathname, O_RDONLY) in {
+    if (path_valid != 0) then {
+      return path_valid;
+    };
+
+    if ((inode_data(file_data(pathname).inode).mode & S_IFDIR) == S_IFDIR) then {
+      return -EISDIR;
+    };
+
+    let res := extern call real_truncate(path, length) in {
+      requires (res == 0);
+      if (inode_data(file_data(pathname).inode).sz >= length) then {
+        # truncate case: simply set size value, no need to discard old values actually
+        inode_data(file_data(pathname).inode).sz := length;
+      } else {
+        # extend case: zero out bytes from old size to new size
+        inode_data(file_data(pathname).inode).content[inode_data(file_data(pathname).inode).sz:length] := 0;
+        inode_data(file_data(pathname).inode).sz := length;
+      };
+      
+      return res;
+    };
+  };
+  };
+}
